@@ -47,11 +47,13 @@ from ghidra.program.model.listing import ParameterImpl, VariableStorage
 from ghidra.program.model.listing import LocalVariableImpl, Function
 from ghidra.program.model.symbol import SourceType
 from ghidra.program.model.listing import ReturnParameterImpl
+from ghidra.util.exception import DuplicateNameException
 
 
 from generic.json import JSONParser, JSONError
 from java.lang import String
 from java.util import ArrayList, Map, List
+import sys
 
 # currentProgram
 # currentSelection
@@ -127,8 +129,11 @@ listing = currentProgram.getListing()
 rootProgramModule = listing.getDefaultRootModule()
 dtm = currentProgram.getDataTypeManager()
 
+segmentToName = {1: 'BEGTEXT', 2: 'SCODE', 3: 'DGROUP' }
+
 def getMemoryBlockFromSegment(segment):
-    memoryBlock = getMemoryBlock('.object' + str(segment))
+    # memoryBlock = getMemoryBlock('.object' + str(segment))
+    memoryBlock = getMemoryBlock(segmentToName[segment])
     return memoryBlock
 
 def getAddressFromSegment(segment, address):
@@ -138,7 +143,7 @@ def getAddressFromSegment(segment, address):
 def groupIntoFragments():
     for addrTable in addressesTable:
         segment = addrTable["segment"]
-        memoryBlock = getMemoryBlock('.object' + str(segment))
+        memoryBlock = getMemoryBlock(segmentToName[segment])
         # print(memoryBlock)
         # print(memoryBlock.getStart())
         for addrInfo in addrTable["addressInfo"]:
@@ -248,7 +253,7 @@ def innerCreateType(moduleIndex, typeIndex, withName = None, withNameIndex = Non
         highBound = typeRoot['highBound']
         baseType = createType(moduleIndex, baseTypeCode)
         if baseType is not None:
-            return ArrayDataType(baseType, highBound)
+            return ArrayDataType(baseType, highBound + 1)
         # print('array type:', baseTypeCode, highBound)
     elif entryType == 'STRUCTURE_LIST':
         categoryPath = createTypeCategory('/' + module['name'] + '/struct')
@@ -297,7 +302,7 @@ def innerCreateType(moduleIndex, typeIndex, withName = None, withNameIndex = Non
             # print("foo: {}, {}".format(paramType, i))
             if paramType is not None and paramType != VoidDataType.dataType:
                 try:
-                    func.replaceArgument(i, None, paramType, None, SourceType.USER_DEFINED)
+                    func.replaceArgument(i, None, paramType, None, SourceType.IMPORTED)
                 except:
                     print('failed to replace arg! func: {} arg: {} type: {}'.format(func.getName(), i, paramType.getName()))
             elif paramType is None:
@@ -330,13 +335,17 @@ for local in modulesLocals:
     moduleIndex = local['meta']['moduleIndex']
     baseAddr = None
     func = None
+    blockParentOffset = None        
+    blockSize = None
+    returnAddressOffset = None
+
     for entry in local['entries']:
         # print(entry)
         if entry["typeName"] == 'MODULE386':
             newType = createType(moduleIndex, entry['typeIndex'])
             memoryBlock = getMemoryBlockFromSegment(entry['segment'])
             address = getAddressFromSegment(entry['segment'], entry['location'])
-            createLabel(address, entry['symbolName'], False, SourceType.USER_DEFINED)
+            createLabel(address, entry['symbolName'], False, SourceType.IMPORTED)
             if newType is not None:
                 try:
                     # print("assigning type: {}: {}".format(entry['symbolName'], newType.getName()))
@@ -347,6 +356,8 @@ for local in modulesLocals:
         elif entry["typeName"] == 'SET_BASE386':
             baseAddr = getAddressFromSegment(entry['segment'], entry['location'])
         elif entry['typeName'] == 'NEAR_RTN_386' or entry['typeName'] == 'FAR_RTN_386' or entry['typeName'] ==  'NEAR_RTN' or entry['typeName'] == 'FAR_RTN':
+            blockParentOffset = None
+            blockSize = None
             # startOffset, size, parentBlockOffset, returnAddressOffset, typeIndex, returnValueLocation
             # numberOfPregisterParams, registerParams, symbolName
 
@@ -354,22 +365,25 @@ for local in modulesLocals:
             size = entry['size']
             registerParams = entry.get('registerParams', [])
             returnValueLocation = entry.get('returnValueLocation', [])[0]
+            returnAddressOffset = entry.get('returnAddressOffset', 0)
             address = baseAddr.add(entry['startOffset'])
             func = functionManager.getFunctionAt(address)
             
             if func is not None:
                 old_name = func.getName()
-                func.setName(name, SourceType.USER_DEFINED)
+                func.setName(name, SourceType.IMPORTED)
                 print("Renamed function {} to {} at address {}".format(old_name, name, address))
             else:
-                func = functionManager.createFunction(name, address, AddressSet(address, address.add(size - 1)), SourceType.USER_DEFINED)
+                func = functionManager.createFunction(name, address, AddressSet(address, address.add(size - 1)), SourceType.IMPORTED)
                 print("Created function {} at address {}".format(name, address))
 
             returnType = None
+            functionDataType = None
             try:
-                returnType = createType(moduleIndex, entry['typeIndex'])
+                functionDataType = createType(moduleIndex, entry['typeIndex'], withName=name)
+                returnType = functionDataType.getReturnType()
                 if returnValueLocation['lsmName'] == 'UNKNOWN':
-                    func.setReturnType(returnType, SourceType.USER_DEFINED)    
+                    func.setReturnType(returnType, SourceType.IMPORTED)    
                 else:
                     if returnValueLocation['lsmName'] == "MULTI_REG":
                         func.setCustomVariableStorage(True)
@@ -377,7 +391,7 @@ for local in modulesLocals:
                         reg = currentProgram.getRegister(regName)
                         varStorage = VariableStorage(currentProgram, reg)
                         try:
-                            func.setReturn(returnType, varStorage, SourceType.USER_DEFINED)
+                            func.setReturn(returnType, varStorage, SourceType.IMPORTED)
                         except:
                             print('failed to set function return type')
                             pass
@@ -388,43 +402,68 @@ for local in modulesLocals:
             if len(registerParams) > 0:
                 func.setCustomVariableStorage(True)
 
+            fdtArgs = functionDataType.getArguments()
             varStorageParams = []
-            for i in range(len(registerParams)):
-                registerParam = registerParams[i][0]
-               
-                if registerParam['lsmName'] == "MULTI_REG":
-                    regName = registerParam['registerNames'][0]
-                    reg = currentProgram.getRegister(regName)
-                    varStorage = VariableStorage(currentProgram, reg)
-                    param = ParameterImpl(None, Undefined.getUndefinedDataType(reg.getNumBytes()), varStorage, currentProgram)
+            for i in range(max(len(registerParams), len(fdtArgs))):
+                if i < len(registerParams):
+                    registerParam = registerParams[i][0]
+                
+                    if registerParam['lsmName'] == "MULTI_REG":
+                        regName = registerParam['registerNames'][0]
+                        reg = currentProgram.getRegister(regName)
+                        varStorage = VariableStorage(currentProgram, reg)
+                        if i < len(fdtArgs):
+                            paramType = fdtArgs[i].getDataType()
+                        else:
+                                paramType = Undefined.getUndefinedDataType(reg.getNumBytes())
+                        param = ParameterImpl(None, paramType, varStorage, currentProgram)
+                        varStorageParams.append(param)
+                else:
+                    param = ParameterImpl(None, fdtArgs[i].getDataType(), None, currentProgram)
                     varStorageParams.append(param)
 
-            func.replaceParameters(varStorageParams, Function.FunctionUpdateType.CUSTOM_STORAGE, True, SourceType.USER_DEFINED)
-            # func.updateFunction(Function.UpdateType.CUSTOM_STORAGE, True, SourceType.USER_DEFINED, varStorageParams)
+            func.replaceParameters(varStorageParams, Function.FunctionUpdateType.CUSTOM_STORAGE, True, SourceType.IMPORTED)
+            # func.updateFunction(Function.UpdateType.CUSTOM_STORAGE, True, SourceType.IMPORTED, varStorageParams)
         elif entry['typeName'] == 'LOCAL':
             if func is not None:
                 symbolName = entry['symbolName']
                 location = entry['location'][0]
                 datatypeIndex = entry['typeIndex']
-                # todo: CONST_ADDR386
+                
                 if location['lsmName'].startswith('BP_OFFSET'):
                     offset = location['offset']
+                    # add `returnAddressOffset` to `offset` because ghidra uses the ESP and not EBP!
+                    # and by "add" I mean "subtract" since these are all negative
+                    if returnAddressOffset is not None:
+                        offset = offset - returnAddressOffset
+
                     #if dataType.getLength() > 0:
                     #    storage = VariableStorage(currentProgram, offset, dataType.getLength())
-                    #    var = LocalVariableImpl(symbolName, 0, dataType, storage, True, currentProgram, SourceType.USER_DEFINED)
+                    #    var = LocalVariableImpl(symbolName, 0, dataType, storage, True, currentProgram, SourceType.IMPORTED)
                     #else:
                     try:
                         localDataType = createType(moduleIndex, datatypeIndex)
-                        var = LocalVariableImpl(symbolName, localDataType, offset, currentProgram, SourceType.USER_DEFINED)
-                        func.addLocalVariable(var, SourceType.USER_DEFINED)
+                        var = LocalVariableImpl(symbolName, localDataType, offset, currentProgram, SourceType.IMPORTED)
+                        # if blockParentOffset is not None:
+                        # turns out this isn't allowed for stack variables
+                        #    var.setFirstUseOffset(blockParentOffset)
+                        try:
+                            func.addLocalVariable(var, SourceType.IMPORTED)
+                        except DuplicateNameException:
+                            var.setName('{}_{:08x}'.format(symbolName, offset), SourceType.IMPORTED)
+                            func.addLocalVariable(var, SourceType.IMPORTED)
+
                     except:
                         print('exception! failed to add var {} to func {}'.format(symbolName, func.getName()))
+                        print(sys.exc_info())
                 elif location['lsmName'] == "CONST_ADDR386":
                     localDataType = createType(moduleIndex, entry['typeIndex'])
                     address = getAddressFromSegment(location['constSegment'], location['constAddress'])
 
-                    var = LocalVariableImpl(symbolName, 0, localDataType, address, currentProgram, SourceType.USER_DEFINED)
-                    func.addLocalVariable(var, SourceType.USER_DEFINED)
+                    var = LocalVariableImpl(symbolName, 0, localDataType, address, currentProgram, SourceType.IMPORTED)
+                    if blockParentOffset is not None:
+                        var.setFirstUseOffset(blockParentOffset)
+                    func.addLocalVariable(var, SourceType.IMPORTED)
                     
                 else:
                     print('local: unhandled location {} for local for func {}'.format(location, func.getName()))
@@ -437,27 +476,40 @@ for local in modulesLocals:
                         # "size": 93,
                         # "parentBlockOffset": 304
             func = None
+            address = baseAddr.add(entry['startOffset'])
+            endAddress = address.add(entry['size'])
+            createLabel(address, 'block_start_{:08x}'.format(entry['startOffset']), False)
+            createLabel(endAddress, 'block_end_{:08x}'.format(entry['startOffset']), False)
+            func = functionManager.getFunctionContaining(address)
+            if func is None:
+                print('BLOCK_386: cannot find func at {}'.format(address))
+            else:
+                blockParentOffset = entry['parentBlockOffset']
+                blockSize = entry['size']
+                print('BLOCK_386: found func {} at address {}'.format(func.getName(), address))
+
         else:
             print("unhandled local entry: {}".format(entry['typeName']))
 
 
 def processGlobalSymbolsTable():
     for g in globalSymbolsTable:
+        # for some reason bools aren't getting parsed out of the JSON correctly...
         addressOffset = g['addressOffset']
         addressSegment = g['addressSegment']
-        isCode = g['isCode']
-        isData = g['isData']
-        name = g['name']
+
+        name = g['name'].encode('utf-8')
 
         address = getAddressFromSegment(addressSegment, addressOffset)
-        if isCode and name.endswith('_'):
-            name = name.removesuffix('_')
-        elif isCode:
-            isCode = False
-        elif isData and name.startswith('_'):
-            name.removeprefix('_')
+        kind = 'data'
+        if name.endswith('_'):
+            name = name[:-1]
+            kind = 'code'
+        elif name.startswith('_'):
+            name = name[1:]
         
-        if not isCode:
+        
+        if kind == 'data':
             createLabel(address, name, False)
         else:
             func = functionManager.getFunctionAt(address)
@@ -465,7 +517,7 @@ def processGlobalSymbolsTable():
             if func is not None:
                 old_name = func.getName()
                 if old_name != name:
-                    func.setName(name, SourceType.USER_DEFINED)
+                    func.setName(name, SourceType.IMPORTED)
                     print("Renamed function {} to {} at address {}".format(old_name, name, address))
             else:
                 func = createFunction(address, name)
